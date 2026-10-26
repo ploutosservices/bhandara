@@ -1,0 +1,69 @@
+# A complete, throwaway deployment: PostgreSQL, an S3 store, the service, and nginx as the mTLS proxy with
+# its own CA. Nothing here is a production setting.
+#
+#   docker compose run --build --rm tests     then   docker compose down -v
+#
+# starts everything the tests depend on, runs the unit tests and the end-to-end tests (tests/e2e.py)
+# against it, and exits with their result.
+name: bhandara-demo
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: storage
+      POSTGRES_USER: storage
+      POSTGRES_HOST_AUTH_METHOD: trust     # demo only: no password on a throwaway network
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "storage", "-d", "storage"]
+      interval: 2s
+      retries: 30
+
+  # Any S3-compatible store works; the demo uses SeaweedFS's S3 server with no credentials
+  # configured, which accepts any key.
+  s3:
+    image: chrislusf/seaweedfs:3.80
+    command: server -dir=/data -s3 -s3.port=8333
+
+  certs:
+    build: { context: ., target: test }
+    command: ["python", "demo/make-certs.py", "/certs"]
+    user: root
+    volumes:
+      - certs:/certs
+
+  storage:
+    build: { context: ., target: app }
+    env_file: .env.example
+    depends_on:
+      postgres: { condition: service_healthy }
+      s3: { condition: service_started }
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./demo/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - certs:/certs:ro
+    ports:
+      - "127.0.0.1:8443:8443"     # to try it with curl and a demo certificate
+    depends_on:
+      certs: { condition: service_completed_successfully }
+      storage: { condition: service_started }
+
+  tests:
+    build: { context: ., target: test }
+    command: ["sh", "-c", "python -m unittest discover -s tests -v && python tests/e2e.py"]
+    environment:
+      E2E_URL: https://nginx:8443
+      E2E_CERTS: /certs
+      E2E_S3_URL: http://s3:8333
+    env_file: .env.example
+    volumes:
+      - certs:/certs:ro
+    depends_on:
+      nginx: { condition: service_started }
+
+volumes:
+  certs:
